@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import os
 import random
@@ -12,6 +13,13 @@ from PIL import Image, ImageOps
 
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def _effective_workers(workers: int) -> int:
+    if workers <= 0:
+        cpu = os.cpu_count() or 4
+        return min(32, max(1, cpu * 2))
+    return max(1, int(workers))
 
 
 @dataclass(frozen=True)
@@ -638,6 +646,7 @@ def build_collage(
     pad: str,
     stats: dict[str, float] | None = None,
     resample: Image.Resampling = Image.Resampling.LANCZOS,
+    workers: int = 0,
 ) -> Image.Image:
     out = Image.new("RGB", (canvas.width, canvas.height), color=background)
 
@@ -645,28 +654,31 @@ def build_collage(
     cover_cropped = 0
     cover_crop_area_sum = 0.0
 
-    for p in placed:
-        img = open_image(p.path)
-        ow, oh = img.size
-        if ow <= 0 or oh <= 0:
-            continue
+    def prepare_one(p: PlacedImg):
+        try:
+            img = open_image(p.path)
+            ow, oh = img.size
+            if ow <= 0 or oh <= 0:
+                return None
 
-        if fit == "cover":
-            scale = max(p.w / ow, p.h / oh)
-            new_w = max(p.w, int(math.ceil(ow * scale)))
-            new_h = max(p.h, int(math.ceil(oh * scale)))
-            resized = safe_resize(img, (new_w, new_h), resample=resample)
+            if fit == "cover":
+                scale = max(p.w / ow, p.h / oh)
+                new_w = max(p.w, int(math.ceil(ow * scale)))
+                new_h = max(p.h, int(math.ceil(oh * scale)))
+                resized = safe_resize(img, (new_w, new_h), resample=resample)
 
-            cover_total += 1
-            if new_w != p.w or new_h != p.h:
-                cover_cropped += 1
-                cover_crop_area_sum += (new_w * new_h - p.w * p.h) / float(new_w * new_h)
+                add_total = 1
+                add_cropped = 0
+                add_crop_sum = 0.0
+                if new_w != p.w or new_h != p.h:
+                    add_cropped = 1
+                    add_crop_sum = (new_w * new_h - p.w * p.h) / float(new_w * new_h)
 
-            left = max(0, (new_w - p.w) // 2)
-            top = max(0, (new_h - p.h) // 2)
-            cropped = resized.crop((left, top, left + p.w, top + p.h))
-            out.paste(cropped, (p.x, p.y))
-        else:
+                left = max(0, (new_w - p.w) // 2)
+                top = max(0, (new_h - p.h) // 2)
+                cropped = resized.crop((left, top, left + p.w, top + p.h))
+                return (cropped, p.x, p.y, add_total, add_cropped, add_crop_sum)
+
             scale = min(p.w / ow, p.h / oh)
             new_w = max(1, int(math.floor(ow * scale)))
             new_h = max(1, int(math.floor(oh * scale)))
@@ -678,14 +690,40 @@ def build_collage(
 
             if pad == "reflect":
                 filled = pad_reflect(resized, p.w, p.h)
-                out.paste(filled, (p.x, p.y))
-            elif pad == "edge":
+                return (filled, p.x, p.y, 0, 0, 0.0)
+            if pad == "edge":
                 filled = pad_repeat_edges(resized, p.w, p.h)
-                out.paste(filled, (p.x, p.y))
-            else:
-                paste_x = p.x + (p.w - new_w) // 2
-                paste_y = p.y + (p.h - new_h) // 2
-                out.paste(resized, (paste_x, paste_y))
+                return (filled, p.x, p.y, 0, 0, 0.0)
+
+            paste_x = p.x + (p.w - new_w) // 2
+            paste_y = p.y + (p.h - new_h) // 2
+            return (resized, paste_x, paste_y, 0, 0, 0.0)
+        except Exception:
+            return None
+
+    n_workers = _effective_workers(workers)
+    if n_workers <= 1 or len(placed) <= 2:
+        for p in placed:
+            res = prepare_one(p)
+            if res is None:
+                continue
+            img, x, y, add_total, add_cropped, add_crop_sum = res
+            out.paste(img, (x, y))
+            cover_total += add_total
+            cover_cropped += add_cropped
+            cover_crop_area_sum += add_crop_sum
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futs = [ex.submit(prepare_one, p) for p in placed]
+            for fut in as_completed(futs):
+                res = fut.result()
+                if res is None:
+                    continue
+                img, x, y, add_total, add_cropped, add_crop_sum = res
+                out.paste(img, (x, y))
+                cover_total += add_total
+                cover_cropped += add_cropped
+                cover_crop_area_sum += add_crop_sum
 
     if stats is not None and fit == "cover":
         stats["cover_total"] = float(cover_total)
@@ -695,18 +733,29 @@ def build_collage(
     return out
 
 
-def collect_img_infos(paths: Sequence[Path]) -> List[ImgInfo]:
-    infos: List[ImgInfo] = []
-    for p in paths:
+def collect_img_infos(paths: Sequence[Path], workers: int = 0) -> List[ImgInfo]:
+    def probe(p: Path) -> ImgInfo | None:
         try:
             with Image.open(p) as img:
                 img = ImageOps.exif_transpose(img)
                 w, h = img.size
         except Exception:
-            continue
+            return None
         if w <= 1 or h <= 1:
-            continue
-        infos.append(ImgInfo(path=p, w=w, h=h))
+            return None
+        return ImgInfo(path=p, w=w, h=h)
+
+    n_workers = _effective_workers(workers)
+    if n_workers <= 1 or len(paths) <= 8:
+        infos: List[ImgInfo] = []
+        for p in paths:
+            info = probe(p)
+            if info is not None:
+                infos.append(info)
+        return infos
+
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        infos = [info for info in ex.map(probe, paths) if info is not None]
     return infos
 
 
@@ -848,6 +897,13 @@ def main() -> int:
         help="Print cover cropping statistics to stdout",
     )
 
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Thread workers for image IO/resize. 0 means auto.",
+    )
+
     args = parser.parse_args()
 
     canvas = parse_canvas(args.preset, args.size)
@@ -861,7 +917,7 @@ def main() -> int:
         rng = random.Random(args.seed)
         rng.shuffle(files)
 
-    infos = collect_img_infos(files)
+    infos = collect_img_infos(files, workers=args.workers)
     if len(infos) < 2:
         raise SystemExit("Need at least 2 readable images")
 
@@ -904,6 +960,7 @@ def main() -> int:
         fit=args.fit,
         pad=args.pad,
         stats=stat_map,
+        workers=args.workers,
     )
 
     if args.stats and placed:
