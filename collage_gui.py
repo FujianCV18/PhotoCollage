@@ -8,7 +8,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 
-from PIL import ImageTk
+from PIL import Image, ImageTk
 
 import collage
 
@@ -344,7 +344,8 @@ class CollageGui(tk.Tk):
 
             self.after(0, update_ui)
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            msg = str(e)
+            self.after(0, lambda m=msg: messagebox.showerror("Error", m))
         finally:
             self.after(0, lambda: self._set_busy(False))
 
@@ -416,7 +417,8 @@ class CollageGui(tk.Tk):
 
                 self.after(0, lambda: messagebox.showinfo("完成", f"已保存: {out_path}"))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Error", str(e)))
+                msg = str(e)
+                self.after(0, lambda m=msg: messagebox.showerror("Error", m))
             finally:
                 self.after(0, lambda: self._set_busy(False))
 
@@ -441,9 +443,11 @@ class YearCollageTab(ttk.Frame):
         self.recursive_var = tk.BooleanVar(value=False)
 
         self.preview_res_var = tk.StringVar(value="720")
-        self.output_size_var = tk.StringVar(value="3:2 (1620x1080)")
+        self.output_size_var = tk.StringVar(value="16:9 (1920x1080)")
 
         self.year_var = tk.StringVar(value="2025")
+
+        self.year_style_var = tk.StringVar(value="渐变")
 
         self.avg_var = tk.DoubleVar(value=0.80)
         self.avg_label_var = tk.StringVar(value=f"{self.avg_var.get():.2f}")
@@ -490,15 +494,16 @@ class YearCollageTab(ttk.Frame):
         ttk.Entry(out_row, textvariable=self.output_var, width=42).grid(row=0, column=0, sticky="ew")
         ttk.Button(out_row, text="选择...", command=self._choose_output).grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Label(left, text="输出尺寸(3:2，支持手动输入 WxH)").grid(row=6, column=0, sticky="w")
+        ttk.Label(left, text="输出尺寸(16:9，支持手动输入 WxH)").grid(row=6, column=0, sticky="w")
         out_size = ttk.Combobox(
             left,
             textvariable=self.output_size_var,
             values=[
-                "3:2 (1620x1080)",
-                "3:2 (2160x1440)",
-                "3:2 (3000x2000)",
-                "3:2 (6000x4000)",
+                "16:9 (1280x720)",
+                "16:9 (1920x1080)",
+                "16:9 (2560x1440)",
+                "16:9 (3840x2160)",
+                "16:9 (6000x3375)",
             ],
             state="normal",
             width=18,
@@ -518,13 +523,17 @@ class YearCollageTab(ttk.Frame):
         ttk.Label(left, text="文字(数字，例如 2025)").grid(row=10, column=0, sticky="w")
         ttk.Entry(left, textvariable=self.year_var, width=14).grid(row=11, column=0, sticky="w", pady=(4, 10))
 
-        ttk.Label(left, text="平均度(越大越平均，步进0.01)").grid(row=12, column=0, sticky="w")
+        ttk.Label(left, text="文字样式").grid(row=12, column=0, sticky="w")
+        year_style = ttk.Combobox(left, textvariable=self.year_style_var, values=["纯色", "渐变"], state="readonly", width=10)
+        year_style.grid(row=13, column=0, sticky="w", pady=(4, 10))
+
+        ttk.Label(left, text="平均度(越大越平均，步进0.01)").grid(row=14, column=0, sticky="w")
         avg = ttk.Scale(left, from_=0.0, to=1.0, variable=self.avg_var, orient="horizontal", command=self._on_avg_changed)
-        avg.grid(row=13, column=0, sticky="ew")
-        ttk.Label(left, textvariable=self.avg_label_var).grid(row=14, column=0, sticky="w", pady=(2, 10))
+        avg.grid(row=15, column=0, sticky="ew")
+        ttk.Label(left, textvariable=self.avg_label_var).grid(row=16, column=0, sticky="w", pady=(2, 10))
 
         btn_row = ttk.Frame(left)
-        btn_row.grid(row=15, column=0, sticky="ew", pady=(8, 8))
+        btn_row.grid(row=17, column=0, sticky="ew", pady=(8, 8))
         btn_row.columnconfigure(0, weight=1)
         btn_row.columnconfigure(1, weight=1)
         self.preview_btn = ttk.Button(btn_row, text="生成预览", command=self._on_preview)
@@ -533,14 +542,14 @@ class YearCollageTab(ttk.Frame):
         self.refresh_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
         self.save_btn = ttk.Button(left, text="保存输出(高质量)", command=self._on_save)
-        self.save_btn.grid(row=16, column=0, sticky="ew")
+        self.save_btn.grid(row=18, column=0, sticky="ew")
 
         self._progress = ttk.Progressbar(left, mode="indeterminate")
-        self._progress.grid(row=17, column=0, sticky="ew", pady=(8, 0))
+        self._progress.grid(row=19, column=0, sticky="ew", pady=(8, 0))
 
-        ttk.Separator(left, orient="horizontal").grid(row=18, column=0, sticky="ew", pady=(10, 10))
-        ttk.Label(left, textvariable=self.status_var, foreground="#444").grid(row=19, column=0, sticky="w")
-        ttk.Label(left, textvariable=self.stats_var, foreground="#444").grid(row=20, column=0, sticky="w", pady=(6, 0))
+        ttk.Separator(left, orient="horizontal").grid(row=20, column=0, sticky="ew", pady=(10, 10))
+        ttk.Label(left, textvariable=self.status_var, foreground="#444").grid(row=21, column=0, sticky="w")
+        ttk.Label(left, textvariable=self.stats_var, foreground="#444").grid(row=22, column=0, sticky="w", pady=(6, 0))
 
         self.preview_label = ttk.Label(right)
         self.preview_label.grid(row=0, column=0, sticky="nsew")
@@ -588,8 +597,42 @@ class YearCollageTab(ttk.Frame):
             self.preview_res_var.get().strip(),
             self.output_size_var.get().strip(),
             self.year_var.get().strip(),
+            self.year_style_var.get().strip(),
             self._snap01(float(self.avg_var.get())),
         )
+
+    def _apply_year_overlay(self, img: Image.Image, mask: collage.Image.Image) -> Image.Image:
+        if mask is None:
+            return img
+        m = mask
+        if m.mode != "L":
+            m = m.convert("L")
+        if m.size != img.size:
+            m = m.resize(img.size, resample=collage.Image.Resampling.NEAREST)
+
+        style = self.year_style_var.get().strip()
+        if style == "纯色":
+            layer = Image.new("RGB", img.size, color=(245, 245, 245))
+            out = img.copy()
+            out.paste(layer, (0, 0), mask=m)
+            return out
+
+        # 渐变(竖向)：上亮下稍暗
+        top = (252, 252, 252)
+        bot = (210, 210, 210)
+        grad = Image.new("RGB", img.size)
+        px = grad.load()
+        h = max(1, img.size[1])
+        for y in range(h):
+            t = y / float(h - 1) if h > 1 else 0.0
+            r = int(round(top[0] * (1 - t) + bot[0] * t))
+            g = int(round(top[1] * (1 - t) + bot[1] * t))
+            b = int(round(top[2] * (1 - t) + bot[2] * t))
+            for x in range(img.size[0]):
+                px[x, y] = (r, g, b)
+        out = img.copy()
+        out.paste(grad, (0, 0), mask=m)
+        return out
 
     def _choose_input(self) -> None:
         folder = filedialog.askdirectory()
@@ -682,31 +725,23 @@ class YearCollageTab(ttk.Frame):
             if not year or re.search(r"\D", year):
                 raise ValueError("文字必须是纯数字，例如 2025")
 
-            region_block_px = max(10, int(round(canvas.width / 60)))
-            inflate_px = max(1, int(round(canvas.width / 320)))
-
-            forbidden_mask = collage.year_forbidden_mask(
-                year,
-                canvas=canvas,
-                box_w_rel=0.84,
-                box_h_rel=0.46,
-                gap_rel=0.18,
-                stroke_rel=0.16,
-                inflate_px=inflate_px,
-            )
-
-            placed = collage.compute_layout_slice_excluding_mask(
+            placed, forbidden_mask = collage.compute_layout_year_three_band(
                 infos,
                 canvas=canvas,
-                forbidden_mask=forbidden_mask,
-                region_block_px=region_block_px,
+                year=year,
                 max_cells=max_cells,
                 slice_iters=slice_iters,
                 slice_tol=0.02,
                 slice_balance=slice_balance,
                 slice_min_share=slice_min_share,
                 seed=seed,
-                min_region_side=max(10, region_block_px),
+                mid_h_rel=1.0 / 3.0,
+                digit_box_w_rel=0.92,
+                digit_box_h_rel=0.86,
+                digit_gap_rel=0.12,
+                digit_stroke_rel=0.16,
+                digit_inset_rel=0.08,
+                region_block_px=max(8, int(round(min(canvas.width, canvas.height) * 0.028))),
             )
 
             stats: dict[str, float] | None = {} if not high_quality else None
@@ -717,19 +752,11 @@ class YearCollageTab(ttk.Frame):
                 fit="cover",
                 pad="reflect",
                 stats=stats,
+                forbidden_mask=forbidden_mask,
                 resample=collage.Image.Resampling.LANCZOS if high_quality else collage.Image.Resampling.BILINEAR,
             )
 
-            digit_masks = collage.stroke_text_digit_masks(
-                year,
-                canvas=canvas,
-                box_w_rel=0.84,
-                box_h_rel=0.46,
-                gap_rel=0.18,
-                stroke_rel=0.16,
-            )
-            palette = [(240, 196, 76), (243, 180, 90), (238, 158, 106), (236, 132, 123)]
-            img = collage.fill_text_masks(img, digit_masks, palette)
+            img = self._apply_year_overlay(img, forbidden_mask)
 
             if not high_quality:
                 self._last_preview_img = img
@@ -765,7 +792,8 @@ class YearCollageTab(ttk.Frame):
                 self.after(0, lambda: messagebox.showinfo("完成", f"已保存: {out_path}"))
 
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            msg = str(e)
+            self.after(0, lambda m=msg: messagebox.showerror("Error", m))
         finally:
             self.after(0, lambda: self._set_busy(False))
 

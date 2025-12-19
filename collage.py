@@ -14,6 +14,9 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
+# allow large images; keep a very high limit to avoid PIL warning spam
+Image.MAX_IMAGE_PIXELS = max(int(getattr(Image, "MAX_IMAGE_PIXELS", 0) or 0), 250_000_000)
+
 
 def _effective_workers(workers: int) -> int:
     if workers <= 0:
@@ -311,6 +314,69 @@ def text_digit_boxes(
     return rects
 
 
+def text_digit_gap_rects(
+    text: str,
+    canvas: CanvasSpec,
+    box_w_rel: float,
+    box_h_rel: float,
+    gap_rel: float,
+) -> list[Rect]:
+    """计算数字之间的间隙区域，用于放置竖图"""
+    t = text.strip()
+    if not t or len(t) < 2:
+        return []
+    if any(ch not in "0123456789" for ch in t):
+        raise ValueError("text must be digits only")
+
+    box_w = max(1, int(round(canvas.width * float(box_w_rel))))
+    box_h = max(1, int(round(canvas.height * float(box_h_rel))))
+    x0 = (canvas.width - box_w) // 2
+    y0 = (canvas.height - box_h) // 2
+
+    n = len(t)
+    gap = int(round((box_w / max(1, n)) * float(gap_rel)))
+    total_gap = gap * (n - 1)
+    digit_w = max(1, (box_w - total_gap) // n)
+    digit_h = box_h
+
+    # 计算数字之间的间隙矩形
+    gap_rects: list[Rect] = []
+    for i in range(n - 1):
+        # 第i个数字的右边界
+        digit_right = x0 + i * (digit_w + gap) + digit_w
+        # 间隙区域
+        gap_rects.append(Rect(digit_right, y0, gap, digit_h))
+    return gap_rects
+
+
+def text_side_gap_rects(
+    text: str,
+    canvas: CanvasSpec,
+    box_w_rel: float,
+    box_h_rel: float,
+    gap_rel: float,
+) -> list[Rect]:
+    """计算数字区域两侧的空白区域，用于放置竖图"""
+    t = text.strip()
+    if not t:
+        return []
+
+    box_w = max(1, int(round(canvas.width * float(box_w_rel))))
+    box_h = max(1, int(round(canvas.height * float(box_h_rel))))
+    x0 = (canvas.width - box_w) // 2
+    y0 = (canvas.height - box_h) // 2
+
+    side_rects: list[Rect] = []
+    # 左侧空白
+    if x0 > 0:
+        side_rects.append(Rect(0, 0, x0, canvas.height))
+    # 右侧空白
+    right_x = x0 + box_w
+    if right_x < canvas.width:
+        side_rects.append(Rect(right_x, 0, canvas.width - right_x, canvas.height))
+    return side_rects
+
+
 def expand_rect(r: Rect, pad: int, canvas: CanvasSpec) -> Rect:
     x0 = max(0, r.x - pad)
     y0 = max(0, r.y - pad)
@@ -574,6 +640,292 @@ def compute_layout_slice_excluding_mask(
     return placed_all
 
 
+def compute_layout_year_three_band(
+    imgs: Sequence[ImgInfo],
+    canvas: CanvasSpec,
+    year: str,
+    max_cells: int,
+    slice_iters: int,
+    slice_tol: float,
+    slice_balance: float,
+    slice_min_share: float,
+    seed: int | None,
+    mid_h_rel: float = 0.56,
+    digit_box_w_rel: float = 0.90,
+    digit_box_h_rel: float = 0.56,
+    digit_gap_rel: float = 0.16,
+    digit_stroke_rel: float = 0.24,
+    digit_inset_rel: float = 0.08,
+    region_block_px: int = 26,
+    band_parts: Tuple[int, int, int] = (2, 5, 2),
+) -> tuple[List[PlacedImg], Image.Image]:
+    """
+    改进版布局：
+    - 上下区域用照片填充
+    - 中间区域只在数字缺口放横图，数字间隙放竖图
+    - 数字笔画框架保持纯色/渐变
+    """
+    if not imgs:
+        return [], Image.new("L", (canvas.width, canvas.height), 0)
+
+    w, h = int(canvas.width), int(canvas.height)
+    if w <= 0 or h <= 0:
+        return [], Image.new("L", (max(1, w), max(1, h)), 0)
+
+    bt, bm, bb = (int(band_parts[0]), int(band_parts[1]), int(band_parts[2]))
+    if bt < 0 or bm < 0 or bb < 0 or (bt + bm + bb) <= 0:
+        bt, bm, bb = 2, 5, 2
+    total_parts = bt + bm + bb
+    raw = [h * (bt / float(total_parts)), h * (bm / float(total_parts)), h * (bb / float(total_parts))]
+    base = [int(math.floor(v)) for v in raw]
+    rem = int(h - sum(base))
+    fracs = [raw[i] - base[i] for i in range(3)]
+    order = sorted(range(3), key=lambda i: fracs[i], reverse=True)
+    for i in range(max(0, rem)):
+        base[order[i % 3]] += 1
+    top_h, mh, bot_h = base[0], base[1], base[2]
+    if top_h + mh + bot_h != h:
+        bot_h = max(0, h - top_h - mh)
+    band_top = Rect(0, 0, w, top_h)
+    band_mid = Rect(0, top_h, w, mh)
+    band_bot = Rect(0, top_h + mh, w, bot_h)
+
+    rng = random.Random(seed)
+    pool = list(imgs)
+    rng.shuffle(pool)
+    budget = max(1, min(len(pool), int(max_cells)))
+    pool = pool[:budget]
+
+    placed_all: list[PlacedImg] = []
+
+    # 计算中间区域的数字相关矩形
+    hole_rects: list[Rect] = []
+    gap_rects: list[Rect] = []
+    side_rects: list[Rect] = []
+    digit_mask_mid = Image.new("L", (w, max(1, mh)), 0)
+    
+    if band_mid.h > 0:
+        mid_canvas = CanvasSpec(w, mh)
+        boxes = text_digit_boxes(
+            year,
+            canvas=mid_canvas,
+            box_w_rel=float(digit_box_w_rel),
+            box_h_rel=float(digit_box_h_rel),
+            gap_rel=float(digit_gap_rel),
+        )
+
+        masks = block_text_digit_masks(
+            year,
+            canvas=mid_canvas,
+            box_w_rel=float(digit_box_w_rel),
+            box_h_rel=float(digit_box_h_rel),
+            gap_rel=float(digit_gap_rel),
+            stroke_rel=float(digit_stroke_rel),
+            inset_rel=float(digit_inset_rel),
+        )
+        if masks:
+            digit_mask_mid = union_masks(masks, (w, mh))
+
+        # 获取数字缺口区域（放横图）
+        for ch, br in zip(year.strip(), boxes):
+            hole_rects.extend(
+                block_digit_hole_rects(
+                    ch,
+                    br,
+                    stroke_rel=float(digit_stroke_rel),
+                    inset_rel=float(digit_inset_rel),
+                )
+            )
+        
+        # 获取数字之间的间隙区域（放竖图）
+        gap_rects = text_digit_gap_rects(
+            year,
+            canvas=mid_canvas,
+            box_w_rel=float(digit_box_w_rel),
+            box_h_rel=float(digit_box_h_rel),
+            gap_rel=float(digit_gap_rel),
+        )
+        
+        # 获取数字区域两侧的空白区域（放竖图）
+        side_rects = text_side_gap_rects(
+            year,
+            canvas=mid_canvas,
+            box_w_rel=float(digit_box_w_rel),
+            box_h_rel=float(digit_box_h_rel),
+            gap_rel=float(digit_gap_rel),
+        )
+
+    # 计算中间区域需要的图片数量：缺口 + 间隙 + 两侧
+    mid_slot_count = len(hole_rects) + len(gap_rects) + len(side_rects)
+    mid_slot_count = min(mid_slot_count, budget)
+    remaining = max(0, budget - mid_slot_count)
+
+    # 上下区域按面积分配剩余图片
+    a_top = band_top.area
+    a_bot = band_bot.area
+    a_sum = max(1, a_top + a_bot)
+
+    top_k = int(round(remaining * (a_top / float(a_sum)))) if a_top > 0 else 0
+    top_k = max(0, min(top_k, remaining))
+    bot_k = max(0, remaining - top_k)
+
+    # 分配图片
+    pool_idx = 0
+    
+    # 优先选择横图给缺口，竖图给间隙
+    horizontal_imgs = [img for img in pool if img.aspect >= 1.0]  # 横图
+    vertical_imgs = [img for img in pool if img.aspect < 1.0]     # 竖图
+    
+    # 如果没有足够的横图或竖图，用所有图片
+    if len(horizontal_imgs) < len(hole_rects):
+        horizontal_imgs = list(pool)
+    if len(vertical_imgs) < len(gap_rects) + len(side_rects):
+        vertical_imgs = list(pool)
+    
+    rng.shuffle(horizontal_imgs)
+    rng.shuffle(vertical_imgs)
+
+    # 上区域照片
+    top_imgs = pool[pool_idx : pool_idx + top_k] if top_k > 0 else []
+    pool_idx += top_k
+    
+    # 下区域照片
+    bot_imgs = pool[pool_idx : pool_idx + bot_k] if bot_k > 0 else []
+    pool_idx += bot_k
+
+    # 上区域布局
+    if band_top.h > 0 and top_imgs:
+        local = compute_layout_slice(
+            top_imgs,
+            canvas=CanvasSpec(band_top.w, band_top.h),
+            max_cells=len(top_imgs),
+            slice_iters=slice_iters,
+            slice_tol=slice_tol,
+            slice_balance=slice_balance,
+            slice_min_share=slice_min_share,
+            seed=None if seed is None else int(seed) + 101,
+        )
+        for p in local:
+            placed_all.append(PlacedImg(path=p.path, x=p.x + band_top.x, y=p.y + band_top.y, w=p.w, h=p.h))
+
+    # 下区域布局
+    if band_bot.h > 0 and bot_imgs:
+        local = compute_layout_slice(
+            bot_imgs,
+            canvas=CanvasSpec(band_bot.w, band_bot.h),
+            max_cells=len(bot_imgs),
+            slice_iters=slice_iters,
+            slice_tol=slice_tol,
+            slice_balance=slice_balance,
+            slice_min_share=slice_min_share,
+            seed=None if seed is None else int(seed) + 303,
+        )
+        for p in local:
+            placed_all.append(PlacedImg(path=p.path, x=p.x + band_bot.x, y=p.y + band_bot.y, w=p.w, h=p.h))
+
+    # 中间区域：数字缺口放横图
+    if band_mid.h > 0 and hole_rects:
+        for i, rr in enumerate(hole_rects):
+            if i < len(horizontal_imgs):
+                info = horizontal_imgs[i]
+                placed_all.append(
+                    PlacedImg(
+                        path=info.path,
+                        x=rr.x,
+                        y=rr.y + band_mid.y,
+                        w=rr.w,
+                        h=rr.h,
+                    )
+                )
+
+    # 中间区域：数字间隙放竖图
+    if band_mid.h > 0 and gap_rects:
+        vert_idx = 0
+        for rr in gap_rects:
+            if vert_idx < len(vertical_imgs):
+                info = vertical_imgs[vert_idx]
+                vert_idx += 1
+                placed_all.append(
+                    PlacedImg(
+                        path=info.path,
+                        x=rr.x,
+                        y=rr.y + band_mid.y,
+                        w=rr.w,
+                        h=rr.h,
+                    )
+                )
+
+    # 中间区域：两侧空白放竖图
+    if band_mid.h > 0 and side_rects:
+        vert_idx = len(gap_rects)  # 继续用竖图
+        for rr in side_rects:
+            if vert_idx < len(vertical_imgs):
+                info = vertical_imgs[vert_idx]
+                vert_idx += 1
+                placed_all.append(
+                    PlacedImg(
+                        path=info.path,
+                        x=rr.x,
+                        y=rr.y + band_mid.y,
+                        w=rr.w,
+                        h=rr.h,
+                    )
+                )
+
+    forbidden = Image.new("L", (w, h), 0)
+    if band_mid.h > 0:
+        forbidden.paste(digit_mask_mid, (0, band_mid.y))
+    return placed_all, forbidden
+
+
+def compute_layout_grid_excluding_mask(
+    imgs: Sequence[ImgInfo],
+    canvas: CanvasSpec,
+    forbidden_mask: Image.Image,
+    max_cells: int,
+    seed: int | None,
+) -> List[PlacedImg]:
+    if not imgs:
+        return []
+
+    if forbidden_mask.mode != "L":
+        forbidden_mask = forbidden_mask.convert("L")
+    if forbidden_mask.size != (canvas.width, canvas.height):
+        forbidden_mask = forbidden_mask.resize((canvas.width, canvas.height), resample=Image.Resampling.NEAREST)
+
+    target = max(1, int(max_cells))
+    aspect = canvas.width / canvas.height if canvas.height else 1.0
+    cols = max(1, int(round(math.sqrt(target * aspect))))
+    rows = max(1, int(math.ceil(target / float(cols))))
+
+    col_ws = distribute_pixels(canvas.width, cols)
+    row_hs = distribute_pixels(canvas.height, rows)
+
+    free: list[Rect] = []
+    y = 0
+    for rh in row_hs:
+        x = 0
+        for cw in col_ws:
+            if forbidden_mask.crop((x, y, x + cw, y + rh)).getbbox() is None:
+                free.append(Rect(x, y, cw, rh))
+            x += cw
+        y += rh
+
+    if not free:
+        return []
+
+    rng = random.Random(seed)
+    chosen = list(imgs)
+    rng.shuffle(chosen)
+
+    placed: list[PlacedImg] = []
+    for i, r in enumerate(free):
+        info = chosen[i % len(chosen)]
+        placed.append(PlacedImg(path=info.path, x=r.x, y=r.y, w=r.w, h=r.h))
+
+    return placed
+
+
 def solid_text_digit_masks(
     text: str,
     canvas: CanvasSpec,
@@ -710,6 +1062,35 @@ def stroke_text_digit_masks(
     return masks
 
 
+def block_text_digit_masks(
+    text: str,
+    canvas: CanvasSpec,
+    box_w_rel: float = 0.90,
+    box_h_rel: float = 0.92,
+    gap_rel: float = 0.12,
+    stroke_rel: float = 0.22,
+    inset_rel: float = 0.08,
+) -> list[Image.Image]:
+    t = text.strip()
+    if not t:
+        return []
+    if any(ch not in "0123456789" for ch in t):
+        raise ValueError("text must be digits only")
+
+    boxes = text_digit_boxes(t, canvas=canvas, box_w_rel=box_w_rel, box_h_rel=box_h_rel, gap_rel=gap_rel)
+    masks: list[Image.Image] = []
+
+    for ch, r in zip(t, boxes):
+        m = Image.new("L", (canvas.width, canvas.height), 0)
+        draw = ImageDraw.Draw(m)
+        rects = block_digit_stroke_rects(ch, r, stroke_rel=float(stroke_rel), inset_rel=float(inset_rel))
+        for rr in rects:
+            draw.rectangle((rr.x, rr.y, rr.x + rr.w, rr.y + rr.h), fill=255)
+        masks.append(m)
+
+    return masks
+
+
 def centered_box_mask(
     canvas: CanvasSpec,
     box_w_rel: float,
@@ -742,6 +1123,270 @@ def fill_text_masks(img: Image.Image, masks: Sequence[Image.Image], colors: Sequ
         c = colors[i % len(colors)]
         layer = Image.new("RGB", out.size, color=c)
         out.paste(layer, (0, 0), mask=m)
+    return out
+
+
+def block_digit_stroke_rects(d: str, r: Rect, stroke_rel: float = 0.22, inset_rel: float = 0.08) -> list[Rect]:
+    if d not in "0123456789":
+        raise ValueError(f"unsupported digit: {d}")
+
+    x0, y0, w, h = int(r.x), int(r.y), int(r.w), int(r.h)
+    x1, y1 = x0 + w, y0 + h
+    if w <= 0 or h <= 0:
+        return []
+
+    inset = max(0, int(round(min(w, h) * float(inset_rel))))
+    ix0, iy0, ix1, iy1 = x0 + inset, y0 + inset, x1 - inset, y1 - inset
+    if ix1 <= ix0 or iy1 <= iy0:
+        return []
+
+    t = max(1, int(round((iy1 - iy0) * float(stroke_rel))))
+    mid_y = (iy0 + iy1) // 2
+
+    def rect(ax0: int, ay0: int, ax1: int, ay1: int) -> Rect:
+        ax0 = max(x0, min(x1, ax0))
+        ax1 = max(x0, min(x1, ax1))
+        ay0 = max(y0, min(y1, ay0))
+        ay1 = max(y0, min(y1, ay1))
+        if ax1 <= ax0 or ay1 <= ay0:
+            return Rect(0, 0, 0, 0)
+        return Rect(ax0, ay0, ax1 - ax0, ay1 - ay0)
+
+    top = rect(ix0, iy0, ix1, iy0 + t)
+    mid = rect(ix0, mid_y - t // 2, ix1, mid_y + (t - t // 2))
+    bot = rect(ix0, iy1 - t, ix1, iy1)
+
+    left_top = rect(ix0, iy0, ix0 + t, mid_y)
+    left_bot = rect(ix0, mid_y, ix0 + t, iy1)
+    right_top = rect(ix1 - t, iy0, ix1, mid_y)
+    right_bot = rect(ix1 - t, mid_y, ix1, iy1)
+
+    segs: list[Rect] = []
+
+    def add(rr: Rect) -> None:
+        if rr.w > 0 and rr.h > 0:
+            segs.append(rr)
+
+    if d == "0":
+        add(top)
+        add(bot)
+        add(left_top)
+        add(left_bot)
+        add(right_top)
+        add(right_bot)
+    elif d == "1":
+        add(right_top)
+        add(right_bot)
+    elif d == "2":
+        add(top)
+        add(right_top)
+        add(mid)
+        add(left_bot)
+        add(bot)
+    elif d == "3":
+        add(top)
+        add(right_top)
+        add(mid)
+        add(right_bot)
+        add(bot)
+    elif d == "4":
+        add(left_top)
+        add(mid)
+        add(right_top)
+        add(right_bot)
+    elif d == "5":
+        add(top)
+        add(left_top)
+        add(mid)
+        add(right_bot)
+        add(bot)
+    elif d == "6":
+        add(top)
+        add(left_top)
+        add(left_bot)
+        add(mid)
+        add(right_bot)
+        add(bot)
+    elif d == "7":
+        add(top)
+        add(right_top)
+        add(right_bot)
+    elif d == "8":
+        add(top)
+        add(mid)
+        add(bot)
+        add(left_top)
+        add(left_bot)
+        add(right_top)
+        add(right_bot)
+    elif d == "9":
+        add(top)
+        add(left_top)
+        add(mid)
+        add(right_top)
+        add(right_bot)
+        add(bot)
+
+    return segs
+
+
+def _fit_aspect_in_rect(r: Rect, aspect: float) -> Rect:
+    if r.w <= 0 or r.h <= 0:
+        return Rect(0, 0, 0, 0)
+    a = float(aspect) if float(aspect) > 0 else 1.0
+    rw = int(r.w)
+    rh = int(r.h)
+    if rh <= 0:
+        return Rect(r.x, r.y, rw, rh)
+
+    cur = rw / float(rh)
+    if cur >= a:
+        w = max(1, int(round(rh * a)))
+        w = min(w, rw)
+        x = r.x + (rw - w) // 2
+        return Rect(x, r.y, w, rh)
+    h = max(1, int(round(rw / a)))
+    h = min(h, rh)
+    y = r.y + (rh - h) // 2
+    return Rect(r.x, y, rw, h)
+
+
+def block_digit_hole_rects(d: str, r: Rect, stroke_rel: float = 0.22, inset_rel: float = 0.08) -> list[Rect]:
+    if d not in "0123456789":
+        raise ValueError(f"unsupported digit: {d}")
+
+    x0, y0, w, h = int(r.x), int(r.y), int(r.w), int(r.h)
+    x1, y1 = x0 + w, y0 + h
+    if w <= 0 or h <= 0:
+        return []
+
+    inset = max(0, int(round(min(w, h) * float(inset_rel))))
+    ix0, iy0, ix1, iy1 = x0 + inset, y0 + inset, x1 - inset, y1 - inset
+    if ix1 <= ix0 or iy1 <= iy0:
+        return []
+
+    t = max(1, int(round((iy1 - iy0) * float(stroke_rel))))
+    mid_y = (iy0 + iy1) // 2
+    gap = max(1, int(round(t * 0.45)))
+
+    def mk(ax0: int, ay0: int, ax1: int, ay1: int) -> Rect:
+        rr = Rect(ax0, ay0, ax1 - ax0, ay1 - ay0)
+        if rr.w <= 0 or rr.h <= 0:
+            return Rect(0, 0, 0, 0)
+        return rr
+
+    holes: list[Rect] = []
+
+    if d == "0":
+        # 0的内部是一个大的竖向区域
+        inner = mk(ix0 + t + gap, iy0 + t + gap, ix1 - t - gap, iy1 - t - gap)
+        if inner.w > 0 and inner.h > 0:
+            holes.append(inner)  # 不强制比例，保持原区域
+        return [rr for rr in holes if rr.w > 0 and rr.h > 0]
+
+    if d == "1":
+        # 1的左侧区域
+        left_area = mk(ix0 + gap, iy0 + gap, ix1 - t - gap, iy1 - gap)
+        if left_area.w > 0 and left_area.h > 0:
+            holes.append(left_area)
+        return [rr for rr in holes if rr.w > 0 and rr.h > 0]
+
+    if d == "2":
+        # 2的左上和右下两个缺口
+        tl = mk(ix0 + gap, iy0 + t + gap, ix1 - t - gap, mid_y - gap)
+        br = mk(ix0 + t + gap, mid_y + gap, ix1 - gap, iy1 - t - gap)
+        if tl.w > 0 and tl.h > 0:
+            holes.append(tl)
+        if br.w > 0 and br.h > 0:
+            holes.append(br)
+        return [rr for rr in holes if rr.w > 0 and rr.h > 0]
+
+    if d == "3":
+        # 3的左上和左下两个缺口
+        tl = mk(ix0 + gap, iy0 + t + gap, ix1 - t - gap, mid_y - gap)
+        bl = mk(ix0 + gap, mid_y + gap, ix1 - t - gap, iy1 - t - gap)
+        if tl.w > 0 and tl.h > 0:
+            holes.append(tl)
+        if bl.w > 0 and bl.h > 0:
+            holes.append(bl)
+        return [rr for rr in holes if rr.w > 0 and rr.h > 0]
+
+    if d == "4":
+        # 4的左下和上部区域
+        lb = mk(ix0 + gap, mid_y + gap, ix1 - t - gap, iy1 - gap)
+        if lb.w > 0 and lb.h > 0:
+            holes.append(lb)
+        return [rr for rr in holes if rr.w > 0 and rr.h > 0]
+
+    if d == "5":
+        # 5的右上和左下两个缺口
+        ur = mk(ix0 + t + gap, iy0 + t + gap, ix1 - gap, mid_y - gap)
+        ll = mk(ix0 + gap, mid_y + gap, ix1 - t - gap, iy1 - t - gap)
+        if ur.w > 0 and ur.h > 0:
+            holes.append(ur)
+        if ll.w > 0 and ll.h > 0:
+            holes.append(ll)
+        return [rr for rr in holes if rr.w > 0 and rr.h > 0]
+
+    if d == "6":
+        # 6的右上缺口和内部圆
+        ur = mk(ix0 + t + gap, iy0 + t + gap, ix1 - gap, mid_y - gap)
+        inner = mk(ix0 + t + gap, mid_y + gap, ix1 - t - gap, iy1 - t - gap)
+        if ur.w > 0 and ur.h > 0:
+            holes.append(ur)
+        if inner.w > 0 and inner.h > 0:
+            holes.append(inner)
+        return [rr for rr in holes if rr.w > 0 and rr.h > 0]
+
+    if d == "7":
+        # 7的左侧和下部区域
+        left_area = mk(ix0 + gap, iy0 + t + gap, ix1 - t - gap, iy1 - gap)
+        if left_area.w > 0 and left_area.h > 0:
+            holes.append(left_area)
+        return [rr for rr in holes if rr.w > 0 and rr.h > 0]
+
+    if d == "8":
+        # 8的上下两个内部区域
+        top_inner = mk(ix0 + t + gap, iy0 + t + gap, ix1 - t - gap, mid_y - gap)
+        bot_inner = mk(ix0 + t + gap, mid_y + gap, ix1 - t - gap, iy1 - t - gap)
+        if top_inner.w > 0 and top_inner.h > 0:
+            holes.append(top_inner)
+        if bot_inner.w > 0 and bot_inner.h > 0:
+            holes.append(bot_inner)
+        return [rr for rr in holes if rr.w > 0 and rr.h > 0]
+
+    if d == "9":
+        # 9的内部圆和左下缺口
+        inner = mk(ix0 + t + gap, iy0 + t + gap, ix1 - t - gap, mid_y - gap)
+        ll = mk(ix0 + gap, mid_y + gap, ix1 - t - gap, iy1 - t - gap)
+        if inner.w > 0 and inner.h > 0:
+            holes.append(inner)
+        if ll.w > 0 and ll.h > 0:
+            holes.append(ll)
+        return [rr for rr in holes if rr.w > 0 and rr.h > 0]
+
+    return []
+
+
+def block_text_digit_tile_rects(
+    text: str,
+    canvas: CanvasSpec,
+    box_w_rel: float = 0.90,
+    box_h_rel: float = 0.92,
+    gap_rel: float = 0.12,
+    stroke_rel: float = 0.22,
+    inset_rel: float = 0.08,
+) -> list[Rect]:
+    t = text.strip()
+    if not t:
+        return []
+    if any(ch not in "0123456789" for ch in t):
+        raise ValueError("text must be digits only")
+
+    boxes = text_digit_boxes(t, canvas=canvas, box_w_rel=box_w_rel, box_h_rel=box_h_rel, gap_rel=gap_rel)
+    out: list[Rect] = []
+    for ch, b in zip(t, boxes):
+        out.extend(block_digit_stroke_rects(ch, b, stroke_rel=float(stroke_rel), inset_rel=float(inset_rel)))
     return out
 
 
@@ -1258,10 +1903,19 @@ def build_collage(
     fit: str,
     pad: str,
     stats: dict[str, float] | None = None,
+    forbidden_mask: Image.Image | None = None,
     resample: Image.Resampling = Image.Resampling.LANCZOS,
     workers: int = 0,
 ) -> Image.Image:
     out = Image.new("RGB", (canvas.width, canvas.height), color=background)
+
+    fm: Image.Image | None = None
+    if forbidden_mask is not None:
+        fm = forbidden_mask
+        if fm.mode != "L":
+            fm = fm.convert("L")
+        if fm.size != (canvas.width, canvas.height):
+            fm = fm.resize((canvas.width, canvas.height), resample=Image.Resampling.NEAREST)
 
     cover_total = 0
     cover_cropped = 0
@@ -1321,7 +1975,14 @@ def build_collage(
             if res is None:
                 continue
             img, x, y, add_total, add_cropped, add_crop_sum = res
-            out.paste(img, (x, y))
+            if fm is not None:
+                cut = fm.crop((x, y, x + img.size[0], y + img.size[1]))
+                if cut.getbbox() is None:
+                    out.paste(img, (x, y))
+                else:
+                    out.paste(img, (x, y), mask=ImageChops.invert(cut))
+            else:
+                out.paste(img, (x, y))
             cover_total += add_total
             cover_cropped += add_cropped
             cover_crop_area_sum += add_crop_sum
@@ -1333,7 +1994,14 @@ def build_collage(
                 if res is None:
                     continue
                 img, x, y, add_total, add_cropped, add_crop_sum = res
-                out.paste(img, (x, y))
+                if fm is not None:
+                    cut = fm.crop((x, y, x + img.size[0], y + img.size[1]))
+                    if cut.getbbox() is None:
+                        out.paste(img, (x, y))
+                    else:
+                        out.paste(img, (x, y), mask=ImageChops.invert(cut))
+                else:
+                    out.paste(img, (x, y))
                 cover_total += add_total
                 cover_cropped += add_cropped
                 cover_crop_area_sum += add_crop_sum
