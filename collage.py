@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -136,6 +136,64 @@ class ImgInfo:
         return self.w / self.h if self.h else 1.0
 
 
+def rect_intersects(a: Rect, b: Rect) -> bool:
+    return not (
+        a.x + a.w <= b.x
+        or b.x + b.w <= a.x
+        or a.y + a.h <= b.y
+        or b.y + b.h <= a.y
+    )
+
+
+def rect_intersection(a: Rect, b: Rect) -> Rect | None:
+    x0 = max(a.x, b.x)
+    y0 = max(a.y, b.y)
+    x1 = min(a.x + a.w, b.x + b.w)
+    y1 = min(a.y + a.h, b.y + b.h)
+    w = x1 - x0
+    h = y1 - y0
+    if w <= 0 or h <= 0:
+        return None
+    return Rect(x0, y0, w, h)
+
+
+def subtract_rect(base: Rect, cut: Rect) -> list[Rect]:
+    inter = rect_intersection(base, cut)
+    if inter is None:
+        return [base]
+
+    out: list[Rect] = []
+    top_h = inter.y - base.y
+    if top_h > 0:
+        out.append(Rect(base.x, base.y, base.w, top_h))
+
+    bottom_y = inter.y + inter.h
+    bottom_h = (base.y + base.h) - bottom_y
+    if bottom_h > 0:
+        out.append(Rect(base.x, bottom_y, base.w, bottom_h))
+
+    left_w = inter.x - base.x
+    if left_w > 0:
+        out.append(Rect(base.x, inter.y, left_w, inter.h))
+
+    right_x = inter.x + inter.w
+    right_w = (base.x + base.w) - right_x
+    if right_w > 0:
+        out.append(Rect(right_x, inter.y, right_w, inter.h))
+
+    return [r for r in out if r.w > 0 and r.h > 0]
+
+
+def subtract_rects(base: Rect, cuts: Sequence[Rect]) -> list[Rect]:
+    rects = [base]
+    for c in cuts:
+        next_rects: list[Rect] = []
+        for r in rects:
+            next_rects.extend(subtract_rect(r, c))
+        rects = next_rects
+    return [r for r in rects if r.w > 0 and r.h > 0]
+
+
 @dataclass
 class PlacedImg:
     path: Path
@@ -191,6 +249,499 @@ def pad_repeat_edges(img: Image.Image, target_w: int, target_h: int) -> Image.Im
         )
         out.paste(strip, (0, oy + h))
 
+    return out
+
+
+def _digit_polylines(d: str) -> list[list[tuple[float, float]]]:
+    m = 0.10
+    if d == "0":
+        return [[(m, m), (1 - m, m), (1 - m, 1 - m), (m, 1 - m), (m, m)]]
+    if d == "1":
+        return [[(0.55, m), (0.55, 1 - m)], [(0.40, 1 - m), (0.70, 1 - m)]]
+    if d == "2":
+        return [[(m, m), (1 - m, m), (1 - m, 0.50), (m, 0.50), (m, 1 - m), (1 - m, 1 - m)]]
+    if d == "3":
+        return [[(m, m), (1 - m, m), (1 - m, 0.50), (m, 0.50), (1 - m, 0.50), (1 - m, 1 - m), (m, 1 - m)]]
+    if d == "4":
+        return [[(m, m), (m, 0.58)], [(m, 0.58), (1 - m, 0.58)], [(1 - m, m), (1 - m, 1 - m)]]
+    if d == "5":
+        return [[(1 - m, m), (m, m), (m, 0.50), (1 - m, 0.50), (1 - m, 1 - m), (m, 1 - m)]]
+    if d == "6":
+        return [[(1 - m, m), (m, m), (m, 1 - m), (1 - m, 1 - m), (1 - m, 0.50), (m, 0.50)]]
+    if d == "7":
+        return [[(m, m), (1 - m, m), (1 - m, 1 - m)]]
+    if d == "8":
+        return [
+            [(m, m), (1 - m, m), (1 - m, 1 - m), (m, 1 - m), (m, m)],
+            [(m, 0.50), (1 - m, 0.50)],
+        ]
+    if d == "9":
+        return [[(1 - m, 0.50), (m, 0.50), (m, m), (1 - m, m), (1 - m, 1 - m), (m, 1 - m)]]
+    raise ValueError(f"unsupported digit: {d}")
+
+
+def text_digit_boxes(
+    text: str,
+    canvas: CanvasSpec,
+    box_w_rel: float,
+    box_h_rel: float,
+    gap_rel: float,
+) -> list[Rect]:
+    t = text.strip()
+    if not t:
+        return []
+    if any(ch not in "0123456789" for ch in t):
+        raise ValueError("text must be digits only")
+
+    box_w = max(1, int(round(canvas.width * float(box_w_rel))))
+    box_h = max(1, int(round(canvas.height * float(box_h_rel))))
+    x0 = (canvas.width - box_w) // 2
+    y0 = (canvas.height - box_h) // 2
+
+    n = len(t)
+    gap = int(round((box_w / max(1, n)) * float(gap_rel)))
+    total_gap = gap * (n - 1)
+    digit_w = max(1, (box_w - total_gap) // n)
+    digit_h = box_h
+
+    rects: list[Rect] = []
+    for i in range(n):
+        dx = x0 + i * (digit_w + gap)
+        rects.append(Rect(dx, y0, digit_w, digit_h))
+    return rects
+
+
+def expand_rect(r: Rect, pad: int, canvas: CanvasSpec) -> Rect:
+    x0 = max(0, r.x - pad)
+    y0 = max(0, r.y - pad)
+    x1 = min(canvas.width, r.x + r.w + pad)
+    y1 = min(canvas.height, r.y + r.h + pad)
+    return Rect(x0, y0, max(0, x1 - x0), max(0, y1 - y0))
+
+
+def union_masks(masks: Sequence[Image.Image], size: tuple[int, int]) -> Image.Image:
+    out = Image.new("L", size, 0)
+    for m in masks:
+        if m.size != size:
+            m = m.resize(size, resample=Image.Resampling.NEAREST)
+        if m.mode != "L":
+            m = m.convert("L")
+        out = ImageChops.lighter(out, m)
+    return out
+
+
+def mask_to_rects(mask: Image.Image, block: int, inflate: int = 0) -> list[Rect]:
+    if mask.mode != "L":
+        mask = mask.convert("L")
+    w, h = mask.size
+    block = max(1, int(block))
+    cols = max(1, (w + block - 1) // block)
+    rows = max(1, (h + block - 1) // block)
+
+    grid: list[list[bool]] = [[False] * cols for _ in range(rows)]
+    for ry in range(rows):
+        y0 = ry * block
+        y1 = min(h, y0 + block)
+        for cx in range(cols):
+            x0 = cx * block
+            x1 = min(w, x0 + block)
+            if mask.crop((x0, y0, x1, y1)).getbbox() is not None:
+                grid[ry][cx] = True
+
+    rects: list[Rect] = []
+    active: dict[tuple[int, int], Rect] = {}
+
+    for ry in range(rows):
+        row_runs: list[tuple[int, int]] = []
+        run_start: int | None = None
+        for cx in range(cols):
+            if grid[ry][cx]:
+                if run_start is None:
+                    run_start = cx
+            else:
+                if run_start is not None:
+                    row_runs.append((run_start, cx - 1))
+                    run_start = None
+        if run_start is not None:
+            row_runs.append((run_start, cols - 1))
+
+        next_active: dict[tuple[int, int], Rect] = {}
+        for c0, c1 in row_runs:
+            key = (c0, c1)
+            if key in active:
+                prev = active[key]
+                next_active[key] = Rect(prev.x, prev.y, prev.w, prev.h + block)
+            else:
+                x0 = c0 * block
+                x1 = min(w, (c1 + 1) * block)
+                y0 = ry * block
+                y1 = min(h, y0 + block)
+                next_active[key] = Rect(x0, y0, x1 - x0, y1 - y0)
+
+        for key, r in active.items():
+            if key not in next_active:
+                rects.append(r)
+        active = next_active
+
+    rects.extend(active.values())
+
+    if inflate > 0:
+        rects = [expand_rect(r, pad=int(inflate), canvas=CanvasSpec(w, h)) for r in rects]
+
+    return [r for r in rects if r.w > 0 and r.h > 0]
+
+
+def year_forbidden_rects(
+    text: str,
+    canvas: CanvasSpec,
+    box_w_rel: float,
+    box_h_rel: float,
+    gap_rel: float,
+    stroke_rel: float,
+    block_px: int,
+    inflate_px: int,
+) -> list[Rect]:
+    masks = stroke_text_digit_masks(
+        text,
+        canvas=canvas,
+        box_w_rel=box_w_rel,
+        box_h_rel=box_h_rel,
+        gap_rel=gap_rel,
+        stroke_rel=stroke_rel,
+    )
+    if not masks:
+        return []
+
+    u = union_masks(masks, (canvas.width, canvas.height))
+    if inflate_px > 0:
+        k = int(inflate_px) * 2 + 1
+        u = u.filter(ImageFilter.MaxFilter(size=max(3, k)))
+
+    return mask_to_rects(u, block=int(block_px), inflate=0)
+
+
+def year_forbidden_mask(
+    text: str,
+    canvas: CanvasSpec,
+    box_w_rel: float,
+    box_h_rel: float,
+    gap_rel: float,
+    stroke_rel: float,
+    inflate_px: int,
+) -> Image.Image:
+    masks = stroke_text_digit_masks(
+        text,
+        canvas=canvas,
+        box_w_rel=box_w_rel,
+        box_h_rel=box_h_rel,
+        gap_rel=gap_rel,
+        stroke_rel=stroke_rel,
+    )
+    if not masks:
+        return Image.new("L", (canvas.width, canvas.height), 0)
+
+    u = union_masks(masks, (canvas.width, canvas.height))
+    if inflate_px > 0:
+        k = int(inflate_px) * 2 + 1
+        u = u.filter(ImageFilter.MaxFilter(size=max(3, k)))
+    return u
+
+
+def mask_to_free_rects(mask: Image.Image, block: int) -> list[Rect]:
+    if mask.mode != "L":
+        mask = mask.convert("L")
+    w, h = mask.size
+    block = max(1, int(block))
+    cols = max(1, (w + block - 1) // block)
+    rows = max(1, (h + block - 1) // block)
+
+    grid: list[list[bool]] = [[False] * cols for _ in range(rows)]
+    for ry in range(rows):
+        y0 = ry * block
+        y1 = min(h, y0 + block)
+        for cx in range(cols):
+            x0 = cx * block
+            x1 = min(w, x0 + block)
+            if mask.crop((x0, y0, x1, y1)).getbbox() is None:
+                grid[ry][cx] = True
+
+    rects: list[Rect] = []
+    active: dict[tuple[int, int], Rect] = {}
+
+    for ry in range(rows):
+        row_runs: list[tuple[int, int]] = []
+        run_start: int | None = None
+        for cx in range(cols):
+            if grid[ry][cx]:
+                if run_start is None:
+                    run_start = cx
+            else:
+                if run_start is not None:
+                    row_runs.append((run_start, cx - 1))
+                    run_start = None
+        if run_start is not None:
+            row_runs.append((run_start, cols - 1))
+
+        next_active: dict[tuple[int, int], Rect] = {}
+        for c0, c1 in row_runs:
+            key = (c0, c1)
+            if key in active:
+                prev = active[key]
+                next_active[key] = Rect(prev.x, prev.y, prev.w, prev.h + block)
+            else:
+                x0 = c0 * block
+                x1 = min(w, (c1 + 1) * block)
+                y0 = ry * block
+                y1 = min(h, y0 + block)
+                next_active[key] = Rect(x0, y0, x1 - x0, y1 - y0)
+
+        for key, r in active.items():
+            if key not in next_active:
+                rects.append(r)
+        active = next_active
+
+    rects.extend(active.values())
+    return [r for r in rects if r.w > 0 and r.h > 0]
+
+
+def compute_layout_slice_excluding_mask(
+    imgs: Sequence[ImgInfo],
+    canvas: CanvasSpec,
+    forbidden_mask: Image.Image,
+    region_block_px: int,
+    max_cells: int,
+    slice_iters: int,
+    slice_tol: float,
+    slice_balance: float,
+    slice_min_share: float,
+    seed: int | None,
+    min_region_side: int = 1,
+) -> List[PlacedImg]:
+    if not imgs:
+        return []
+
+    free = mask_to_free_rects(forbidden_mask, block=int(region_block_px))
+    free = [r for r in free if r.w >= int(min_region_side) and r.h >= int(min_region_side)]
+    if not free:
+        return []
+
+    total_area = sum(r.area for r in free) or 1
+    target_cells = max(1, min(int(max_cells), len(imgs)))
+
+    rng = random.Random(seed)
+    chosen = list(imgs)
+    rng.shuffle(chosen)
+    chosen = chosen[:target_cells]
+
+    alloc: list[int] = []
+    remaining = len(chosen)
+    for i, r in enumerate(free):
+        if i == len(free) - 1:
+            k = remaining
+        else:
+            k = max(1, int(round(len(chosen) * (r.area / total_area))))
+            k = min(k, remaining - (len(free) - i - 1))
+        alloc.append(k)
+        remaining -= k
+
+    placed_all: list[PlacedImg] = []
+    start = 0
+    for i, (r, k) in enumerate(zip(free, alloc)):
+        subset = chosen[start : start + k]
+        start += k
+        if not subset:
+            continue
+
+        if k <= 1:
+            info = subset[0]
+            placed_all.append(PlacedImg(path=info.path, x=r.x, y=r.y, w=r.w, h=r.h))
+            continue
+
+        local_seed = None if seed is None else (int(seed) + 1009 * (i + 1))
+        local = compute_layout_slice(
+            subset,
+            canvas=CanvasSpec(r.w, r.h),
+            max_cells=k,
+            slice_iters=slice_iters,
+            slice_tol=slice_tol,
+            slice_balance=slice_balance,
+            slice_min_share=slice_min_share,
+            seed=local_seed,
+        )
+        for p in local:
+            placed_all.append(PlacedImg(path=p.path, x=p.x + r.x, y=p.y + r.y, w=p.w, h=p.h))
+
+    return placed_all
+
+
+def solid_text_digit_masks(
+    text: str,
+    canvas: CanvasSpec,
+    box_w_rel: float = 0.84,
+    box_h_rel: float = 0.42,
+    gap_rel: float = 0.18,
+    stroke_rel: float = 0.20,
+) -> list[Image.Image]:
+    t = text.strip()
+    if not t:
+        return []
+    if any(ch not in "0123456789" for ch in t):
+        raise ValueError("text must be digits only")
+
+    boxes = text_digit_boxes(t, canvas=canvas, box_w_rel=box_w_rel, box_h_rel=box_h_rel, gap_rel=gap_rel)
+    masks: list[Image.Image] = []
+
+    for ch, r in zip(t, boxes):
+        m = Image.new("L", (canvas.width, canvas.height), 0)
+        draw = ImageDraw.Draw(m)
+
+        th = max(1, int(round(r.h * float(stroke_rel))))
+        pad = max(1, th // 2)
+
+        def rect(x0: int, y0: int, x1: int, y1: int) -> None:
+            draw.rectangle((x0, y0, x1, y1), fill=255)
+
+        x0, y0, w, h = r.x, r.y, r.w, r.h
+        x1, y1 = x0 + w, y0 + h
+
+        inset = max(1, int(round(0.06 * min(w, h))))
+        ix0, iy0, ix1, iy1 = x0 + inset, y0 + inset, x1 - inset, y1 - inset
+        mid_y = (iy0 + iy1) // 2
+
+        if ch == "0":
+            if hasattr(draw, "rounded_rectangle"):
+                draw.rounded_rectangle((ix0, iy0, ix1, iy1), radius=max(1, th), fill=255)
+            else:
+                rect(ix0, iy0, ix1, iy1)
+        elif ch == "1":
+            cx = (ix0 + ix1) // 2
+            rect(cx - th // 2, iy0, cx + th // 2 + 1, iy1)
+        elif ch == "2":
+            rect(ix0, iy0, ix1, iy0 + th)
+            rect(ix1 - th, iy0, ix1, mid_y)
+            rect(ix0, mid_y - th // 2, ix1, mid_y + th // 2 + 1)
+            rect(ix0, mid_y, ix0 + th, iy1)
+            rect(ix0, iy1 - th, ix1, iy1)
+        elif ch == "3":
+            rect(ix0, iy0, ix1, iy0 + th)
+            rect(ix0, mid_y - th // 2, ix1, mid_y + th // 2 + 1)
+            rect(ix0, iy1 - th, ix1, iy1)
+            rect(ix1 - th, iy0, ix1, iy1)
+        elif ch == "4":
+            rect(ix0, iy0, ix0 + th, mid_y)
+            rect(ix0, mid_y - th // 2, ix1, mid_y + th // 2 + 1)
+            rect(ix1 - th, iy0, ix1, iy1)
+        elif ch == "5":
+            rect(ix0, iy0, ix1, iy0 + th)
+            rect(ix0, iy0, ix0 + th, mid_y)
+            rect(ix0, mid_y - th // 2, ix1, mid_y + th // 2 + 1)
+            rect(ix1 - th, mid_y, ix1, iy1)
+            rect(ix0, iy1 - th, ix1, iy1)
+        elif ch == "6":
+            rect(ix0, iy0, ix1, iy0 + th)
+            rect(ix0, iy0, ix0 + th, iy1)
+            rect(ix0, mid_y - th // 2, ix1, mid_y + th // 2 + 1)
+            rect(ix1 - th, mid_y, ix1, iy1)
+            rect(ix0, iy1 - th, ix1, iy1)
+        elif ch == "7":
+            rect(ix0, iy0, ix1, iy0 + th)
+            poly = [(ix1, iy0 + th), (ix1 - th, iy0 + th), (ix0 + th, iy1), (ix0, iy1)]
+            draw.polygon(poly, fill=255)
+        elif ch == "8":
+            rect(ix0, iy0, ix1, iy1)
+            rect(ix0 + pad, iy0 + pad, ix1 - pad, iy1 - pad)
+        elif ch == "9":
+            rect(ix0, iy0, ix1, iy0 + th)
+            rect(ix0, iy0, ix0 + th, mid_y)
+            rect(ix0, mid_y - th // 2, ix1, mid_y + th // 2 + 1)
+            rect(ix1 - th, iy0, ix1, iy1)
+            rect(ix0, iy1 - th, ix1, iy1)
+        else:
+            raise ValueError(f"unsupported digit: {ch}")
+
+        masks.append(m)
+
+    return masks
+
+
+def stroke_text_digit_masks(
+    text: str,
+    canvas: CanvasSpec,
+    box_w_rel: float = 0.84,
+    box_h_rel: float = 0.42,
+    gap_rel: float = 0.18,
+    stroke_rel: float = 0.14,
+) -> list[Image.Image]:
+    t = text.strip()
+    if not t:
+        return []
+    if any(ch not in "0123456789" for ch in t):
+        raise ValueError("text must be digits only")
+
+    box_w = max(1, int(round(canvas.width * float(box_w_rel))))
+    box_h = max(1, int(round(canvas.height * float(box_h_rel))))
+    x0 = (canvas.width - box_w) // 2
+    y0 = (canvas.height - box_h) // 2
+
+    n = len(t)
+    gap = int(round((box_w / max(1, n)) * float(gap_rel)))
+    total_gap = gap * (n - 1)
+    digit_w = max(1, (box_w - total_gap) // n)
+    digit_h = box_h
+
+    stroke = max(1, int(round(digit_h * float(stroke_rel))))
+    r = max(1, stroke // 2)
+
+    masks: list[Image.Image] = []
+    for i, ch in enumerate(t):
+        m = Image.new("L", (canvas.width, canvas.height), 0)
+        draw = ImageDraw.Draw(m)
+        dx = x0 + i * (digit_w + gap)
+
+        for poly in _digit_polylines(ch):
+            pts = [(dx + int(round(px * digit_w)), y0 + int(round(py * digit_h))) for (px, py) in poly]
+            if len(pts) >= 2:
+                draw.line(pts, fill=255, width=stroke)
+            for (x, y) in pts:
+                draw.ellipse((x - r, y - r, x + r, y + r), fill=255)
+
+        masks.append(m)
+
+    return masks
+
+
+def centered_box_mask(
+    canvas: CanvasSpec,
+    box_w_rel: float,
+    box_h_rel: float,
+    radius_rel: float = 0.04,
+) -> Image.Image:
+    box_w = max(1, int(round(canvas.width * float(box_w_rel))))
+    box_h = max(1, int(round(canvas.height * float(box_h_rel))))
+    x0 = (canvas.width - box_w) // 2
+    y0 = (canvas.height - box_h) // 2
+    r = max(0, int(round(min(box_w, box_h) * float(radius_rel))))
+
+    m = Image.new("L", (canvas.width, canvas.height), 0)
+    draw = ImageDraw.Draw(m)
+    if r > 0 and hasattr(draw, "rounded_rectangle"):
+        draw.rounded_rectangle((x0, y0, x0 + box_w, y0 + box_h), radius=r, fill=255)
+    else:
+        draw.rectangle((x0, y0, x0 + box_w, y0 + box_h), fill=255)
+    return m
+
+
+def fill_text_masks(img: Image.Image, masks: Sequence[Image.Image], colors: Sequence[Tuple[int, int, int]]) -> Image.Image:
+    if not masks:
+        return img
+    if not colors:
+        raise ValueError("colors must be non-empty")
+
+    out = img.copy()
+    for i, m in enumerate(masks):
+        c = colors[i % len(colors)]
+        layer = Image.new("RGB", out.size, color=c)
+        out.paste(layer, (0, 0), mask=m)
     return out
 
 
@@ -533,6 +1084,68 @@ def compute_layout_slice(
         min_share=max(0.0, min(0.49, float(slice_min_share))),
     )
     return layout_slice_tree(root, Rect(0, 0, canvas.width, canvas.height))
+
+
+def compute_layout_slice_excluding(
+    imgs: Sequence[ImgInfo],
+    canvas: CanvasSpec,
+    forbidden: Sequence[Rect],
+    max_cells: int,
+    slice_iters: int,
+    slice_tol: float,
+    slice_balance: float,
+    slice_min_share: float,
+    seed: int | None,
+    min_region_side: int = 80,
+) -> List[PlacedImg]:
+    base = Rect(0, 0, canvas.width, canvas.height)
+    free = subtract_rects(base, list(forbidden))
+    free = [r for r in free if r.w >= min_region_side and r.h >= min_region_side]
+    if not free:
+        return []
+
+    total_area = sum(r.area for r in free) or 1
+    target_cells = max(1, min(int(max_cells), len(imgs)))
+
+    rng = random.Random(seed)
+    chosen = list(imgs)
+    rng.shuffle(chosen)
+    chosen = chosen[:target_cells]
+
+    alloc: list[int] = []
+    remaining = len(chosen)
+    for i, r in enumerate(free):
+        if i == len(free) - 1:
+            k = remaining
+        else:
+            k = max(1, int(round(len(chosen) * (r.area / total_area))))
+            k = min(k, remaining - (len(free) - i - 1))
+        alloc.append(k)
+        remaining -= k
+
+    placed_all: list[PlacedImg] = []
+    start = 0
+    for i, (r, k) in enumerate(zip(free, alloc)):
+        subset = chosen[start : start + k]
+        start += k
+        if not subset:
+            continue
+
+        local_seed = None if seed is None else (int(seed) + 1009 * (i + 1))
+        local = compute_layout_slice(
+            subset,
+            canvas=CanvasSpec(r.w, r.h),
+            max_cells=k,
+            slice_iters=slice_iters,
+            slice_tol=slice_tol,
+            slice_balance=slice_balance,
+            slice_min_share=slice_min_share,
+            seed=local_seed,
+        )
+        for p in local:
+            placed_all.append(PlacedImg(path=p.path, x=p.x + r.x, y=p.y + r.y, w=p.w, h=p.h))
+
+    return placed_all
 
 
 def compute_layout_bsp(
