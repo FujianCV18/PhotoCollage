@@ -363,11 +363,13 @@ def text_digit_gap_slot_rects(
     box_w_rel: float,
     box_h_rel: float,
     gap_rel: float,
+    stroke_rel: float = 0.14,
     imgs_per_gap: int = 2,
 ) -> list[Rect]:
     """计算数字之间的间隙区域中每张图片的矩形位置
     
     每个间隙被分成 imgs_per_gap 个槽位，每个槽位放一张竖图
+    间隙区域扩展到紧贴数字笔画边缘
     """
     t = text.strip()
     if not t or len(t) < 2:
@@ -376,12 +378,16 @@ def text_digit_gap_slot_rects(
         raise ValueError("text must be digits only")
 
     box_w = max(1, int(round(canvas.width * float(box_w_rel))))
+    box_h = max(1, int(round(canvas.height * float(box_h_rel))))
     x0 = (canvas.width - box_w) // 2
 
     n = len(t)
     gap = int(round((box_w / max(1, n)) * float(gap_rel)))
     total_gap = gap * (n - 1)
     digit_w = max(1, (box_w - total_gap) // n)
+    
+    # 计算笔画宽度（数字内部的笔画）
+    stroke_w = int(round(digit_w * float(stroke_rel)))
 
     slot_rects: list[Rect] = []
     imgs_per_gap = max(1, imgs_per_gap)
@@ -390,7 +396,16 @@ def text_digit_gap_slot_rects(
     for i in range(n - 1):
         # 第i个数字的右边界
         digit_right = x0 + i * (digit_w + gap) + digit_w
-        # 在这个间隙中创建多个槽位
+        # 下一个数字的左边界
+        next_digit_left = digit_right + gap
+        
+        # 扩展间隙区域：从当前数字笔画内边缘到下一个数字笔画内边缘
+        # 向左扩展到当前数字的笔画内侧，向右扩展到下一个数字的笔画内侧
+        expanded_left = digit_right - stroke_w
+        expanded_right = next_digit_left + stroke_w
+        expanded_w = expanded_right - expanded_left
+        
+        # 在这个扩展间隙中创建多个槽位
         for j in range(imgs_per_gap):
             slot_y = j * slot_h
             # 最后一个槽位取剩余高度，避免舍入误差
@@ -398,7 +413,7 @@ def text_digit_gap_slot_rects(
                 actual_h = canvas.height - slot_y
             else:
                 actual_h = slot_h
-            slot_rects.append(Rect(digit_right, slot_y, gap, actual_h))
+            slot_rects.append(Rect(expanded_left, slot_y, expanded_w, actual_h))
     
     return slot_rects
 
@@ -437,11 +452,13 @@ def text_side_gap_slot_rects(
     box_w_rel: float,
     box_h_rel: float,
     gap_rel: float,
+    stroke_rel: float = 0.14,
     imgs_per_side: int = 2,
 ) -> list[Rect]:
     """计算数字区域两侧的空白区域中每张图片的矩形位置
     
     每侧被分成 imgs_per_side 个槽位，每个槽位放一张竖图
+    侧边区域扩展到紧贴数字笔画边缘
     """
     t = text.strip()
     if not t:
@@ -449,23 +466,31 @@ def text_side_gap_slot_rects(
 
     box_w = max(1, int(round(canvas.width * float(box_w_rel))))
     x0 = (canvas.width - box_w) // 2
+    
+    # 计算数字宽度和笔画宽度
+    n = len(t)
+    gap = int(round((box_w / max(1, n)) * float(gap_rel)))
+    total_gap = gap * (n - 1)
+    digit_w = max(1, (box_w - total_gap) // n)
+    stroke_w = int(round(digit_w * float(stroke_rel)))
 
     slot_rects: list[Rect] = []
     imgs_per_side = max(1, imgs_per_side)
     slot_h = canvas.height // imgs_per_side
     
-    # 左侧空白
-    if x0 > 0:
+    # 左侧空白 - 扩展到第一个数字的笔画内侧
+    left_w = x0 + stroke_w  # 扩展到第一个数字的笔画内侧
+    if left_w > 0:
         for j in range(imgs_per_side):
             slot_y = j * slot_h
             if j == imgs_per_side - 1:
                 actual_h = canvas.height - slot_y
             else:
                 actual_h = slot_h
-            slot_rects.append(Rect(0, slot_y, x0, actual_h))
+            slot_rects.append(Rect(0, slot_y, left_w, actual_h))
     
-    # 右侧空白
-    right_x = x0 + box_w
+    # 右侧空白 - 扩展到最后一个数字的笔画内侧
+    right_x = x0 + box_w - stroke_w  # 从最后一个数字笔画内侧开始
     if right_x < canvas.width:
         right_w = canvas.width - right_x
         for j in range(imgs_per_side):
@@ -496,6 +521,42 @@ def union_masks(masks: Sequence[Image.Image], size: tuple[int, int]) -> Image.Im
             m = m.convert("L")
         out = ImageChops.lighter(out, m)
     return out
+
+
+def erode_mask_horizontal(mask: Image.Image, pixels: int) -> Image.Image:
+    """横向腐蚀mask，只削减左右厚度，保持上下厚度不变
+    
+    Args:
+        mask: L模式的mask图像，白色(255)为笔画区域
+        pixels: 腐蚀的像素数（每边削减的量）
+    
+    Returns:
+        腐蚀后的mask
+    """
+    if pixels <= 0:
+        return mask
+    if mask.mode != "L":
+        mask = mask.convert("L")
+    
+    w, h = mask.size
+    result = mask.copy()
+    
+    # 使用多次1像素腐蚀来实现更精确的横向腐蚀
+    for _ in range(pixels):
+        # 创建左移和右移版本
+        left_shift = Image.new("L", (w, h), 0)
+        right_shift = Image.new("L", (w, h), 0)
+        
+        # 左移1像素（相当于检查右边是否有像素）
+        left_shift.paste(result.crop((1, 0, w, h)), (0, 0))
+        # 右移1像素（相当于检查左边是否有像素）
+        right_shift.paste(result.crop((0, 0, w - 1, h)), (1, 0))
+        
+        # 只保留左右都有像素的地方（横向腐蚀）
+        result = ImageChops.darker(result, left_shift)
+        result = ImageChops.darker(result, right_shift)
+    
+    return result
 
 
 def mask_to_rects(mask: Image.Image, block: int, inflate: int = 0) -> list[Rect]:
@@ -804,6 +865,7 @@ def compute_layout_year_three_band(
     hole_rects: list[Rect] = []
     gap_rects: list[Rect] = []
     side_rects: list[Rect] = []
+    hole_digit_map: list[str] = []  # 记录每个缺口属于哪个数字
     digit_mask_mid = Image.new("L", (w, max(1, mh)), 0)
     
     if band_mid.h > 0:
@@ -827,35 +889,40 @@ def compute_layout_year_three_band(
         )
         if masks:
             digit_mask_mid = union_masks(masks, (w, mh))
+            digit_mask_mid = digit_mask_mid.filter(
+            ImageFilter.MinFilter(3)
+)
 
-        # 获取数字缺口区域（放横图）
+        # 获取数字缺口区域（放图片），同时记录每个缺口属于哪个数字
         for ch, br in zip(year.strip(), boxes):
-            hole_rects.extend(
-                block_digit_hole_rects(
-                    ch,
-                    br,
-                    stroke_rel=float(digit_stroke_rel),
-                    inset_rel=float(digit_inset_rel),
-                )
+            digit_holes = block_digit_hole_rects(
+                ch,
+                br,
+                stroke_rel=float(digit_stroke_rel),
+                inset_rel=float(digit_inset_rel),
             )
+            hole_rects.extend(digit_holes)
+            hole_digit_map.extend([ch] * len(digit_holes))  # 记录属于哪个数字
         
-        # 获取数字之间的间隙槽位（每个间隙放2张竖图，覆盖整个高度）
+        # 获取数字之间的间隙槽位（每个间隙放2张竖图，覆盖整个高度，扩展到笔画边缘）
         gap_slot_rects = text_digit_gap_slot_rects(
             year,
             canvas=mid_canvas,
             box_w_rel=float(digit_box_w_rel),
             box_h_rel=float(digit_box_h_rel),
             gap_rel=float(digit_gap_rel),
+            stroke_rel=float(digit_stroke_rel),
             imgs_per_gap=2,
         )
         
-        # 获取数字区域两侧的槽位（每侧放2张竖图，覆盖整个高度）
+        # 获取数字区域两侧的槽位（每侧放2张竖图，覆盖整个高度，扩展到笔画边缘）
         side_slot_rects = text_side_gap_slot_rects(
             year,
             canvas=mid_canvas,
             box_w_rel=float(digit_box_w_rel),
             box_h_rel=float(digit_box_h_rel),
             gap_rel=float(digit_gap_rel),
+            stroke_rel=float(digit_stroke_rel),
             imgs_per_side=2,
         )
     else:
@@ -879,41 +946,67 @@ def compute_layout_year_three_band(
     top_k = max(0, min(top_k, remaining))
     bot_k = max(0, remaining - top_k)
 
-    # 分配图片
-    pool_idx = 0
-    
+    # 先为中间区域预留图片，再分配上下区域
     # 分离横图和竖图
-    horizontal_imgs = [img for img in pool if img.aspect >= 1.0]  # 横图
-    vertical_imgs = [img for img in pool if img.aspect < 1.0]     # 竖图
+    horizontal_pool = [img for img in pool if img.aspect >= 1.0]  # 横图
+    vertical_pool = [img for img in pool if img.aspect < 1.0]     # 竖图
+    
+    rng.shuffle(horizontal_pool)
+    rng.shuffle(vertical_pool)
     
     # 记录需要旋转的图片路径
     rotate_paths: set[Path] = set()
     
-    # 如果没有足够的竖图，需要从横图中补充（标记为需要旋转）
-    if len(vertical_imgs) < needed_vertical:
-        shortage = needed_vertical - len(vertical_imgs)
-        # 从横图中选择一些来旋转
-        available_horizontal = [img for img in pool if img.aspect >= 1.0]
-        rng.shuffle(available_horizontal)
-        for img in available_horizontal[:shortage]:
-            # 标记这张图需要旋转，并创建旋转后的尺寸信息
+    # 为中间区域分配图片（先分配，避免重复）
+    # 1. 为缺口分配图片（0的缺口强制使用竖图）
+    hole_assigned: list[ImgInfo] = []
+    
+    for i, rr in enumerate(hole_rects):
+        digit_ch = hole_digit_map[i] if i < len(hole_digit_map) else ''
+        
+        # 0的缺口强制使用竖图
+        if digit_ch == '0':
+            if vertical_pool:
+                hole_assigned.append(vertical_pool.pop(0))
+            elif horizontal_pool:
+                # 旋转横图
+                img = horizontal_pool.pop(0)
+                rotate_paths.add(img.path)
+                hole_assigned.append(ImgInfo(path=img.path, w=img.h, h=img.w))
+            else:
+                hole_assigned.append(None)  # type: ignore
+        else:
+            # 其他数字使用横图
+            if horizontal_pool:
+                hole_assigned.append(horizontal_pool.pop(0))
+            elif vertical_pool:
+                hole_assigned.append(vertical_pool.pop(0))
+            else:
+                hole_assigned.append(None)  # type: ignore
+    
+    # 过滤掉None
+    hole_assigned = [img for img in hole_assigned if img is not None]
+    
+    # 2. 为间隙和侧边分配竖图
+    vertical_assigned: list[ImgInfo] = []
+    for _ in range(needed_vertical):
+        if vertical_pool:
+            vertical_assigned.append(vertical_pool.pop(0))
+        elif horizontal_pool:
+            # 需要旋转横图
+            img = horizontal_pool.pop(0)
             rotate_paths.add(img.path)
-            vertical_imgs.append(ImgInfo(path=img.path, w=img.h, h=img.w))
+            vertical_assigned.append(ImgInfo(path=img.path, w=img.h, h=img.w))
     
-    # 如果没有足够的横图给缺口，用所有图片
-    if len(horizontal_imgs) < len(hole_rects):
-        horizontal_imgs = list(pool)
-    
-    rng.shuffle(horizontal_imgs)
-    rng.shuffle(vertical_imgs)
+    # 3. 剩余图片用于上下区域
+    remaining_pool = horizontal_pool + vertical_pool
+    rng.shuffle(remaining_pool)
 
     # 上区域照片
-    top_imgs = pool[pool_idx : pool_idx + top_k] if top_k > 0 else []
-    pool_idx += top_k
+    top_imgs = remaining_pool[:top_k] if top_k > 0 else []
     
     # 下区域照片
-    bot_imgs = pool[pool_idx : pool_idx + bot_k] if bot_k > 0 else []
-    pool_idx += bot_k
+    bot_imgs = remaining_pool[top_k:top_k + bot_k] if bot_k > 0 else []
 
     # 上区域布局
     if band_top.h > 0 and top_imgs:
@@ -945,34 +1038,12 @@ def compute_layout_year_three_band(
         for p in local:
             placed_all.append(PlacedImg(path=p.path, x=p.x + band_bot.x, y=p.y + band_bot.y, w=p.w, h=p.h))
 
-    # 中间区域：数字缺口放图片（优先竖图给0的缺口）
+    # 中间区域：数字缺口放图片（使用预先分配的图片）
     if band_mid.h > 0 and hole_rects:
-        # 找出0的缺口索引（0的缺口通常是竖长的）
-        hole_imgs_assignment = []
-        used_vertical_for_holes = 0
-        vertical_for_holes = [img for img in vertical_imgs]  # 竖图副本
-        
         for i, rr in enumerate(hole_rects):
-            # 判断这个缺口是否需要竖图（高度 > 宽度 * 1.2）
-            needs_vertical = rr.h > rr.w * 1.2
-            
-            if needs_vertical and vertical_for_holes:
-                # 优先用竖图
-                img = vertical_for_holes.pop(0)
-                rotate = 90 if img.path in rotate_paths else 0
-                hole_imgs_assignment.append((img, rotate))
-                used_vertical_for_holes += 1
-            elif horizontal_imgs:
-                img = horizontal_imgs.pop(0)
-                hole_imgs_assignment.append((img, 0))
-            elif vertical_for_holes:
-                img = vertical_for_holes.pop(0)
-                rotate = 90 if img.path in rotate_paths else 0
-                hole_imgs_assignment.append((img, rotate))
-        
-        for i, rr in enumerate(hole_rects):
-            if i < len(hole_imgs_assignment):
-                info, rotate = hole_imgs_assignment[i]
+            if i < len(hole_assigned):
+                info = hole_assigned[i]
+                rotate = 90 if info.path in rotate_paths else 0
                 placed_all.append(
                     PlacedImg(
                         path=info.path,
@@ -998,11 +1069,11 @@ def compute_layout_year_three_band(
             gap_w = base_slot.w
             gap_total_h = mh  # 整个中间带高度
             
-            # 收集这个间隙要放的图片
+            # 收集这个间隙要放的图片（使用预先分配的竖图）
             gap_imgs = []
             for j in range(imgs_per_gap):
-                if vert_idx + j < len(vertical_imgs):
-                    gap_imgs.append(vertical_imgs[vert_idx + j])
+                if vert_idx + j < len(vertical_assigned):
+                    gap_imgs.append(vertical_assigned[vert_idx + j])
             
             if not gap_imgs:
                 vert_idx += imgs_per_gap
@@ -1054,7 +1125,7 @@ def compute_layout_year_three_band(
     if band_mid.h > 0 and side_slot_rects:
         imgs_per_side = 2
         n_sides = len(side_slot_rects) // imgs_per_side if imgs_per_side > 0 else 0
-        vert_idx = len(gap_slot_rects)  # 继续用竖图
+        vert_idx = len(gap_slot_rects)  # 继续用竖图（从gap分配后继续）
         
         for side_i in range(n_sides):
             base_slot = side_slot_rects[side_i * imgs_per_side]
@@ -1062,11 +1133,11 @@ def compute_layout_year_three_band(
             side_w = base_slot.w
             side_total_h = mh
             
-            # 收集这个侧边要放的图片
+            # 收集这个侧边要放的图片（使用预先分配的竖图）
             side_imgs = []
             for j in range(imgs_per_side):
-                if vert_idx + j < len(vertical_imgs):
-                    side_imgs.append(vertical_imgs[vert_idx + j])
+                if vert_idx + j < len(vertical_assigned):
+                    side_imgs.append(vertical_assigned[vert_idx + j])
             
             if not side_imgs:
                 vert_idx += imgs_per_side

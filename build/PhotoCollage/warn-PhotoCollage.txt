@@ -16,7 +16,7 @@ IMPORTANT: Do NOT post this list to the issue-tracker. Use it as a basis for
 
 missing module named pwd - imported by posixpath (delayed, conditional, optional), shutil (delayed, optional), tarfile (optional), pathlib._local (optional), subprocess (delayed, conditional, optional), netrc (delayed, conditional), getpass (delayed, optional)
 missing module named grp - imported by shutil (delayed, optional), tarfile (optional), pathlib._local (optional), subprocess (delayed, conditional, optional)
-missing module named 'collections.abc' - imported by traceback (top-level), typing (top-level), inspect (top-level), logging (top-level), importlib.resources.readers (top-level), selectors (top-level), tracemalloc (top-level), PIL.Image (top-level), PIL._typing (top-level), xml.etree.ElementTree (top-level), PIL.TiffImagePlugin (top-level), PIL.ImageOps (top-level), PIL.ImagePalette (top-level), PIL.GimpGradientFile (conditional), PIL.ImageFilter (top-level), PIL.ImageQt (conditional), PIL.ImageMath (conditional), PIL.ImageSequence (conditional), PIL.PngImagePlugin (conditional), http.client (top-level), PIL.Jpeg2KImagePlugin (conditional)
+missing module named 'collections.abc' - imported by traceback (top-level), typing (top-level), inspect (top-level), logging (top-level), importlib.resources.readers (top-level), selectors (top-level), tracemalloc (top-level), PIL.Image (top-level), PIL._typing (top-level), xml.etree.ElementTree (top-level), PIL.TiffImagePlugin (top-level), PIL.ImageOps (top-level), PIL.ImagePalette (top-level), PIL.GimpGradientFile (conditional), PIL.ImageFilter (top-level), PIL.ImageQt (conditional), PIL.ImageMath (conditional), PIL.ImageSequence (conditional), PIL.PngImagePlugin (conditional), http.client (top-level), PIL.ImageDraw (top-level), PIL._imagingft (top-level), PIL.Jpeg2KImagePlugin (conditional)
 missing module named _posixsubprocess - imported by subprocess (conditional), multiprocessing.util (delayed)
 missing module named fcntl - imported by subprocess (optional)
 missing module named _frozen_importlib_external - imported by importlib._bootstrap (delayed), importlib (optional), importlib.abc (optional), zipimport (top-level)
@@ -33,6 +33,6 @@ missing module named multiprocessing.TimeoutError - imported by multiprocessing 
 missing module named multiprocessing.set_start_method - imported by multiprocessing (top-level), multiprocessing.spawn (top-level)
 missing module named multiprocessing.get_start_method - imported by multiprocessing (top-level), multiprocessing.spawn (top-level)
 missing module named pyimod02_importers - imported by C:\Users\JMU-SB\AppData\Roaming\Python\Python313\site-packages\PyInstaller\hooks\rthooks\pyi_rth_pkgutil.py (delayed)
-missing module named olefile - imported by PIL.FpxImagePlugin (top-level), PIL.MicImagePlugin (top-level)
 missing module named numpy - imported by PIL._typing (conditional, optional)
+missing module named olefile - imported by PIL.FpxImagePlugin (top-level), PIL.MicImagePlugin (top-level)
 missing module named defusedxml - imported by PIL.Image (optional)

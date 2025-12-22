@@ -736,10 +736,10 @@ class YearCollageTab(ttk.Frame):
                 slice_min_share=slice_min_share,
                 seed=seed,
                 mid_h_rel=1.0 / 3.0,
-                digit_box_w_rel=0.92,
+                digit_box_w_rel=0.82,
                 digit_box_h_rel=0.86,
-                digit_gap_rel=0.12,
-                digit_stroke_rel=0.16,
+                digit_gap_rel=0.08,
+                digit_stroke_rel=0.14,
                 digit_inset_rel=0.08,
                 region_block_px=max(8, int(round(min(canvas.width, canvas.height) * 0.028))),
             )
