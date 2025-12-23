@@ -447,7 +447,10 @@ class YearCollageTab(ttk.Frame):
 
         self.year_var = tk.StringVar(value="2025")
 
+        # 固定渐变配色（上->下）
         self.year_style_var = tk.StringVar(value="渐变")
+        self.year_grad_top = (255, 209, 102)  # #ffd166
+        self.year_grad_bot = (239, 71, 111)   # #ef476f
 
         self.avg_var = tk.DoubleVar(value=0.80)
         self.avg_label_var = tk.StringVar(value=f"{self.avg_var.get():.2f}")
@@ -524,8 +527,7 @@ class YearCollageTab(ttk.Frame):
         ttk.Entry(left, textvariable=self.year_var, width=14).grid(row=11, column=0, sticky="w", pady=(4, 10))
 
         ttk.Label(left, text="文字样式").grid(row=12, column=0, sticky="w")
-        year_style = ttk.Combobox(left, textvariable=self.year_style_var, values=["纯色", "渐变"], state="readonly", width=10)
-        year_style.grid(row=13, column=0, sticky="w", pady=(4, 10))
+        ttk.Label(left, text="固定：竖向渐变").grid(row=13, column=0, sticky="w", pady=(0, 10))
 
         ttk.Label(left, text="平均度(越大越平均，步进0.01)").grid(row=14, column=0, sticky="w")
         avg = ttk.Scale(left, from_=0.0, to=1.0, variable=self.avg_var, orient="horizontal", command=self._on_avg_changed)
@@ -601,6 +603,16 @@ class YearCollageTab(ttk.Frame):
             self._snap01(float(self.avg_var.get())),
         )
 
+    def _apply_palette(self, preset: tuple[str, str | None, str | None, str | None]) -> None:
+        style, solid, top, bot = preset
+        self.year_style_var.set(style)
+        if solid:
+            self.year_color_var.set(solid)
+        if top:
+            self.year_grad_top_var.set(top)
+        if bot:
+            self.year_grad_bot_var.set(bot)
+
     def _apply_year_overlay(self, img: Image.Image, mask: collage.Image.Image) -> Image.Image:
         if mask is None:
             return img
@@ -610,16 +622,9 @@ class YearCollageTab(ttk.Frame):
         if m.size != img.size:
             m = m.resize(img.size, resample=collage.Image.Resampling.NEAREST)
 
-        style = self.year_style_var.get().strip()
-        if style == "纯色":
-            layer = Image.new("RGB", img.size, color=(245, 245, 245))
-            out = img.copy()
-            out.paste(layer, (0, 0), mask=m)
-            return out
-
-        # 渐变(竖向)：上亮下稍暗
-        top = (252, 252, 252)
-        bot = (210, 210, 210)
+        # 固定竖向渐变
+        top = self.year_grad_top
+        bot = self.year_grad_bot
         grad = Image.new("RGB", img.size)
         px = grad.load()
         h = max(1, img.size[1])
@@ -745,17 +750,22 @@ class YearCollageTab(ttk.Frame):
             )
 
             stats: dict[str, float] | None = {} if not high_quality else None
+            # 根据样式确定底色：纯色/渐变都用顶部色，确保遮罩处不是黑色
+            bg_color = self.year_grad_top
+
             img = collage.build_collage(
                 placed,
                 canvas=canvas,
-                background=(0, 0, 0),
+                background=bg_color,
                 fit="cover",
                 pad="reflect",
                 stats=stats,
                 forbidden_mask=forbidden_mask,
+                forbidden_fill=(self.year_grad_top, self.year_grad_bot),
                 resample=collage.Image.Resampling.LANCZOS if high_quality else collage.Image.Resampling.BILINEAR,
             )
 
+            # 已固定渐变，额外覆盖保持一致
             img = self._apply_year_overlay(img, forbidden_mask)
 
             if not high_quality:

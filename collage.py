@@ -2214,6 +2214,7 @@ def build_collage(
     pad: str,
     stats: dict[str, float] | None = None,
     forbidden_mask: Image.Image | None = None,
+    forbidden_fill: Tuple[Tuple[int, int, int], Tuple[int, int, int]] | None = None,
     resample: Image.Resampling = Image.Resampling.LANCZOS,
     workers: int = 0,
 ) -> Image.Image:
@@ -2226,6 +2227,8 @@ def build_collage(
             fm = fm.convert("L")
         if fm.size != (canvas.width, canvas.height):
             fm = fm.resize((canvas.width, canvas.height), resample=Image.Resampling.NEAREST)
+        if fm.getbbox() is None:
+            fm = None
 
     cover_total = 0
     cover_cropped = 0
@@ -2322,6 +2325,41 @@ def build_collage(
                 cover_total += add_total
                 cover_cropped += add_cropped
                 cover_crop_area_sum += add_crop_sum
+
+    # 在末端统一为禁用区域上色（可渐变）；避免多个调用点重复逻辑
+    if fm is not None and forbidden_fill is not None:
+        top, bot = forbidden_fill
+
+        def _make_vertical_gradient(size: tuple[int, int], c_top: tuple[int, int, int], c_bot: tuple[int, int, int], gamma: float = 2.0) -> Image.Image:
+            grad = Image.new("RGB", size)
+            px = grad.load()
+            h = max(1, size[1])
+            for y in range(h):
+                t = y / float(h - 1) if h > 1 else 0.0
+                # 使用 gamma 调整，让上下差异更明显
+                if gamma > 0:
+                    t = max(0.0, min(1.0, t)) ** float(gamma)
+                r = int(round(c_top[0] * (1 - t) + c_bot[0] * t))
+                g = int(round(c_top[1] * (1 - t) + c_bot[1] * t))
+                b = int(round(c_top[2] * (1 - t) + c_bot[2] * t))
+                for x in range(size[0]):
+                    px[x, y] = (r, g, b)
+            return grad
+
+        mask = fm
+        if mask.mode != "L":
+            mask = mask.convert("L")
+        if mask.size != out.size:
+            mask = mask.resize(out.size, resample=Image.Resampling.NEAREST)
+
+        bbox = mask.getbbox()
+        if bbox is not None:
+            x0, y0, x1, y1 = bbox
+            patch_w = max(1, x1 - x0)
+            patch_h = max(1, y1 - y0)
+            overlay_patch = _make_vertical_gradient((patch_w, patch_h), top, bot, gamma=2.0)
+            mask_patch = mask.crop(bbox)
+            out.paste(overlay_patch, (x0, y0), mask=mask_patch)
 
     if stats is not None and fit == "cover":
         stats["cover_total"] = float(cover_total)
